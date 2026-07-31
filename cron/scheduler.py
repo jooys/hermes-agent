@@ -1448,6 +1448,110 @@ def _cwd_lock_timeout_seconds() -> float:
     )
 
 
+def _format_cron_duration(seconds: float | int | None) -> str:
+    """Format a cron run duration for compact user-facing Slack summaries."""
+    if seconds is None:
+        return "unknown"
+    try:
+        total = max(0, int(round(float(seconds))))
+    except (TypeError, ValueError):
+        return "unknown"
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    if minutes:
+        return f"{minutes}m {secs}s" if secs else f"{minutes}m"
+    return f"{secs}s"
+
+
+def _clean_cron_summary_line(line: str) -> str:
+    """Remove Markdown list/heading noise from a root Slack summary line."""
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", line or "")
+    text = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_cron_action_lines(content: str, limit: int = 3) -> list[str]:
+    """Prefer action/next-step lines for Slack cron root summaries."""
+    action_heading_re = re.compile(
+        r"^\s{0,3}#{1,6}\s*(?:다음\s*액션|액션\s*아이템|해야\s*할\s*일|next\s+actions?|action\s+items?|todo)\b",
+        re.IGNORECASE,
+    )
+    any_heading_re = re.compile(r"^\s{0,3}#{1,6}\s+")
+    collected: list[str] = []
+    in_action_section = False
+    for raw in (content or "").splitlines():
+        if action_heading_re.search(raw):
+            in_action_section = True
+            continue
+        if in_action_section and any_heading_re.search(raw):
+            break
+        if in_action_section:
+            cleaned = _clean_cron_summary_line(raw)
+            if cleaned:
+                collected.append(cleaned)
+                if len(collected) >= limit:
+                    return collected
+    return collected
+
+
+def _first_meaningful_cron_lines(content: str, limit: int = 3) -> list[str]:
+    """Return readable preview lines, skipping cron wrapper boilerplate."""
+    skip_prefixes = (
+        "Cronjob Response:",
+        "(job_id:",
+        "-------------",
+        "To stop or manage this job,",
+    )
+    result: list[str] = []
+    for raw in (content or "").splitlines():
+        cleaned = _clean_cron_summary_line(raw)
+        if not cleaned or any(cleaned.startswith(prefix) for prefix in skip_prefixes):
+            continue
+        result.append(cleaned)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _build_slack_cron_summary(
+    job: dict,
+    content: str,
+    duration_seconds: float | int | None = None,
+    success: bool = True,
+) -> str:
+    """Build a five-line-or-less Slack channel-root summary for cron output."""
+    job_name = job.get("name") or job.get("id") or "cron job"
+    job_id = job.get("id", "")
+    status_icon = "✅" if success else "⚠️"
+    status_text = "완료" if success else "실패"
+    first_line = f"{status_icon} {job_name} {status_text}"
+    if job_id:
+        first_line += f" · job_id `{job_id}`"
+    first_line += f" · 진행시간 {_format_cron_duration(duration_seconds)}"
+    preview_lines = (
+        _extract_cron_action_lines(content, limit=3)
+        or _first_meaningful_cron_lines(content, limit=3)
+    )
+    summary_lines = [first_line, *(f"- {line}" for line in preview_lines[:3])]
+    summary_lines.append("전체 본문은 이 메시지의 thread에 남겼습니다.")
+    return "\n".join(summary_lines[:5])
+
+
+def _slack_message_id_from_result(result) -> str | None:
+    """Extract Slack ts/message_id from dict or SendResult-style objects."""
+    if not result:
+        return None
+    if isinstance(result, dict):
+        raw = result.get("raw_response")
+        raw_ts = raw.get("ts") if isinstance(raw, dict) else None
+        return result.get("message_id") or result.get("ts") or raw_ts
+    raw = getattr(result, "raw_response", None)
+    raw_ts = raw.get("ts") if isinstance(raw, dict) else None
+    return getattr(result, "message_id", None) or getattr(result, "ts", None) or raw_ts
+
+
 def _get_parallel_pool(max_workers: Optional[int]) -> concurrent.futures.ThreadPoolExecutor:
     """Return (or create) the persistent parallel pool."""
     global _parallel_pool, _parallel_pool_max_workers
@@ -3104,7 +3208,14 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    duration_seconds: float | int | None = None,
+    success: bool = True,
+) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -3144,10 +3255,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output.
     wrap_response = True
+    slack_threaded_delivery = True
     user_cfg = None
     try:
         user_cfg = load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+        cron_cfg = user_cfg.get("cron", {}) if isinstance(user_cfg, dict) else {}
+        wrap_response = cron_cfg.get("wrap_response", True)
+        # Keep Slack channel roots concise unless the user explicitly opts out.
+        slack_threaded_delivery = cron_cfg.get("slack_threaded_delivery", True)
     except Exception:
         pass
 
@@ -3220,6 +3335,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         return msg
 
     delivery_errors = []
+
+    def _run_standalone_send(platform, pconfig, chat_id, message, **kwargs):
+        """Run the standalone sender safely from synchronous cron code."""
+        coro = _send_to_platform(platform, pconfig, chat_id, message, **kwargs)
+        try:
+            return asyncio.run(coro)
+        except RuntimeError as run_err:
+            coro.close()
+            if _interpreter_shutting_down(run_err):
+                raise
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(
+                    asyncio.run,
+                    _send_to_platform(platform, pconfig, chat_id, message, **kwargs),
+                )
+                return future.result(timeout=30)
 
     for target in targets:
         platform_name = target["platform"]
@@ -3349,6 +3480,101 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
+        # A continuable in_channel surface must use the live delivery path:
+        # it seeds the flat session after a confirmed live send. Do not split it
+        # into an unrelated summary root and body thread before that path gets a
+        # chance to establish its continuation context.
+        surface_mode = _resolve_cron_surface_mode(pconfig, platform_name)
+        in_channel_surface = surface_mode == "in_channel"
+        if in_channel_surface and runtime_adapter is not None:
+            per_platform_check = getattr(
+                runtime_adapter, "supports_inchannel_continuable_for_platform", None
+            )
+            if callable(per_platform_check):
+                try:
+                    surface_supported = bool(per_platform_check(platform_name))
+                except Exception:
+                    surface_supported = False
+            else:
+                surface_supported = bool(
+                    getattr(runtime_adapter, "supports_inchannel_continuable", False)
+                )
+            if not surface_supported:
+                logger.debug(
+                    "Job '%s': cron_continuable_surface=in_channel not supported on %s, "
+                    "using thread",
+                    job.get("id", "?"),
+                    platform_name,
+                )
+                in_channel_surface = False
+
+        # A native Slack channel root has a stable ts/message_id contract.
+        # Send the compact root first and only then post the complete body into
+        # that thread. Relay transports stay on their existing live-adapter path:
+        # they do not guarantee a native Slack root id and must not be retried
+        # through an unrelated direct connector.
+        if (
+            slack_threaded_delivery
+            and platform == Platform.SLACK
+            and not thread_id
+            and surface_mode != "in_channel"
+            # Continuable origin jobs need their existing live-adapter/session
+            # seeding flow; only ordinary channel-root cron delivery is split.
+            and not mirror_this_target
+            and not (transport is not None and transport.is_relay)
+        ):
+            try:
+                root_result = _run_standalone_send(
+                    platform,
+                    pconfig,
+                    chat_id,
+                    _build_slack_cron_summary(
+                        job,
+                        content,
+                        duration_seconds=duration_seconds,
+                        success=success,
+                    ),
+                    thread_id=None,
+                    media_files=[],
+                )
+                if isinstance(root_result, dict) and root_result.get("error"):
+                    msg = f"delivery error: {root_result['error']}"
+                    logger.error("Job '%s': %s", job["id"], msg)
+                    delivery_errors.append(msg)
+                    continue
+                root_message_id = _slack_message_id_from_result(root_result)
+                if not root_message_id:
+                    msg = "Slack threaded cron delivery could not determine root message id"
+                    logger.error("Job '%s': %s", job["id"], msg)
+                    delivery_errors.append(msg)
+                    continue
+                thread_result = _run_standalone_send(
+                    platform,
+                    pconfig,
+                    chat_id,
+                    cleaned_delivery_content,
+                    thread_id=root_message_id,
+                    media_files=media_files,
+                )
+                if isinstance(thread_result, dict) and thread_result.get("error"):
+                    msg = f"delivery error: {thread_result['error']}"
+                    logger.error("Job '%s': %s", job["id"], msg)
+                    delivery_errors.append(msg)
+                    continue
+                logger.info(
+                    "Job '%s': delivered threaded Slack cron response to %s:%s root_ts=%s",
+                    job["id"],
+                    platform_name,
+                    chat_id,
+                    root_message_id,
+                )
+                continue
+            except Exception as exc:
+                msg = f"threaded Slack delivery to {platform_name}:{chat_id} failed: {exc}"
+                logger.error("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+
         # Prefer the resolved live transport when the gateway is running. This
         # supports E2EE native adapters and relay-fronted logical platforms.
         # The live-send path (which SEEDS the flat in_channel continuation
@@ -3366,48 +3592,6 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         )
         delivered = False
         target_errors = []
-
-        # Continuable cron surface (D1/D2/D6): resolve the delivery surface for
-        # this platform generically from its config ``extra``. Default "thread"
-        # (today's behaviour, byte-identical). "in_channel" delivers the brief
-        # FLAT into the channel (no dedicated thread) so a plain channel reply
-        # continues the job in-context via the shared-channel session
-        # ``(platform, chat_id, None)`` — the same bucket ``reply_in_thread:
-        # false`` routes inbound channel messages to. The key is read
-        # generically here (any platform); the ``in_channel`` branch is gated on
-        # the adapter capability flag ``supports_inchannel_continuable`` so an
-        # unsupported platform fails SAFE to "thread" (Slack is the first
-        # consumer; "first consumer ≠ definition").
-        surface_mode = _resolve_cron_surface_mode(pconfig, platform_name)
-        in_channel_surface = surface_mode == "in_channel"
-        if in_channel_surface and runtime_adapter is not None:
-            # Per-platform capability first: one RelayAdapter fronts N
-            # platforms and the connector advertises the bit per platform at
-            # handshake — the scalar attr only carries the PRIMARY identity's
-            # bit. Native adapters (no per-platform query) keep the class
-            # attribute path unchanged.
-            per_platform_check = getattr(
-                runtime_adapter, "supports_inchannel_continuable_for_platform",
-                None,
-            )
-            if callable(per_platform_check):
-                try:
-                    surface_supported = bool(per_platform_check(platform_name))
-                except Exception:
-                    surface_supported = False
-            else:
-                surface_supported = bool(getattr(
-                    runtime_adapter, "supports_inchannel_continuable", False
-                ))
-            if not surface_supported:
-                # Fail safe (D6): platform has no in_channel continuation
-                # primitive.
-                logger.debug(
-                    "Job '%s': cron_continuable_surface=in_channel not supported on "
-                    "%s, using thread",
-                    job.get("id", "?"), platform_name,
-                )
-                in_channel_surface = False
 
         if in_channel_surface and inchannel_continuable and live_adapter_ready:
             # Force flat delivery (D2): the continuable-channel target must
@@ -7300,6 +7484,7 @@ def _run_one_job_body(
         # The attempt is claimed durably before executor/provider dispatch and
         # becomes running only immediately before the actual run.
         mark_execution_running(execution_id)
+        run_started_monotonic = time.monotonic()
 
         # Run and deliver under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is active, and cron
@@ -7332,6 +7517,7 @@ def _run_one_job_body(
                     extra_prompt=extra_prompt,
                     cancel_event=fire_claim_lost,
                 )
+            duration_seconds = time.monotonic() - run_started_monotonic
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
@@ -7519,6 +7705,8 @@ def _run_one_job_body(
                             deliver_content,
                             adapters=adapters,
                             loop=loop,
+                            duration_seconds=duration_seconds,
+                            success=success,
                         )
                 except Exception as de:
                     if isinstance(de, _FireClaimLostDuringSideEffect):
